@@ -1,0 +1,131 @@
+name: Check upstream versions
+
+on:
+  schedule:
+    - cron: '23 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: check-upstream
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Compare upstream versions
+        id: compare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          CUR_PI=$(python3 -c "import json;print(json.load(open('versions.json'))['pi'])")
+          CUR_SP=$(python3 -c "import json;print(json.load(open('versions.json'))['screenpipe'])")
+
+          LATEST_PI=$(gh api repos/earendil-works/pi/releases --paginate \
+            | python3 -c "
+          import json,sys
+          rels=[r for r in json.load(sys.stdin) if not r['prerelease'] and not r['draft']]
+          print(rels[0]['tag_name'].lstrip('v') if rels else '')
+          ")
+          LATEST_SP=$(npm view @screenpipe/cli-darwin-arm64 version)
+
+          {
+            echo "cur_pi=$CUR_PI"
+            echo "cur_sp=$CUR_SP"
+            echo "latest_pi=$LATEST_PI"
+            echo "latest_sp=$LATEST_SP"
+          } >> "$GITHUB_OUTPUT"
+
+          PI_UPDATED=false; SP_UPDATED=false
+          [ -n "$LATEST_PI" ] && [ "$LATEST_PI" != "$CUR_PI" ] && PI_UPDATED=true
+          [ -n "$LATEST_SP" ] && [ "$LATEST_SP" != "$CUR_SP" ] && SP_UPDATED=true
+          echo "pi_updated=$PI_UPDATED" >> "$GITHUB_OUTPUT"
+          echo "sp_updated=$SP_UPDATED" >> "$GITHUB_OUTPUT"
+          echo "pi: current=$CUR_PI latest=$LATEST_PI updated=$PI_UPDATED"
+          echo "screenpipe: current=$CUR_SP latest=$LATEST_SP updated=$SP_UPDATED"
+
+      - name: Probe /work-history endpoint in new engine
+        if: steps.compare.outputs.sp_updated == 'true'
+        id: probe
+        run: |
+          set -euo pipefail
+          TMP=$(mktemp -d)
+          cd "$TMP"
+          npm pack @screenpipe/cli-darwin-arm64@${{ steps.compare.outputs.latest_sp }}
+          tar -xzf ./*.tgz
+          COUNT=$(grep -ac "work-history" package/bin/screenpipe || true)
+          if [ "$COUNT" -gt 0 ]; then
+            echo "endpoint=present" >> "$GITHUB_OUTPUT"
+          else
+            echo "endpoint=absent" >> "$GITHUB_OUTPUT"
+          fi
+          echo "grep -ac 'work-history' matched: $COUNT"
+
+      - name: Open bump PR
+        if: steps.compare.outputs.pi_updated == 'true' || steps.compare.outputs.sp_updated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DATE=$(date +%Y-%m-%d)
+          BRANCH="bump/upstream-${DATE}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+
+          CUR_PI='${{ steps.compare.outputs.cur_pi }}'
+          CUR_SP='${{ steps.compare.outputs.cur_sp }}'
+          NEW_PI='${{ steps.compare.outputs.latest_pi }}'
+          NEW_SP='${{ steps.compare.outputs.latest_sp }}'
+
+          python3 - "$NEW_PI" "$NEW_SP" <<'EOF'
+          import json, sys
+          pi, sp = sys.argv[1], sys.argv[2]
+          with open('versions.json') as f:
+              v = json.load(f)
+          if pi: v['pi'] = pi
+          if sp: v['screenpipe'] = sp
+          with open('versions.json', 'w') as f:
+              json.dump(v, f, indent=2)
+              f.write('\n')
+          EOF
+          git add versions.json
+          git commit -m "chore: bump upstream versions ($DATE)"
+
+          PROBE_LINE="probe skipped (engine unchanged)"
+          if [ '${{ steps.probe.outputs.endpoint }}' = 'present' ]; then
+            PROBE_LINE='/work-history endpoint: **present** in screenpipe ${NEW_SP} — see spec §5 for adding pipes'
+          elif [ '${{ steps.probe.outputs.endpoint }}' = 'absent' ]; then
+            PROBE_LINE='/work-history endpoint: **absent** in screenpipe ${NEW_SP}'
+          fi
+
+          cat > /tmp/pr_body.md <<EOF
+          ## Upstream version bump
+
+          | Component | Current | Latest |
+          |---|---|---|
+          | pi | ${CUR_PI} | ${NEW_PI} |
+          | screenpipe | ${CUR_SP} | ${NEW_SP} |
+
+          ${PROBE_LINE}
+
+          Note: bundle version is unchanged; it is bumped manually via a release tag.
+          EOF
+          git push origin "$BRANCH"
+          gh pr create --title "chore: bump upstream versions ($DATE)" \
+            --body-file /tmp/pr_body.md --base "${GITHUB_REF_NAME}"
+
+      - name: Skip (no updates)
+        if: steps.compare.outputs.pi_updated != 'true' && steps.compare.outputs.sp_updated != 'true'
+        run: echo "No upstream updates; nothing to do."

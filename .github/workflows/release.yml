@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build bundle
+        run: node build.mjs --out dist
+
+      - name: Smoke test — verify tarball contents
+        run: |
+          set -euo pipefail
+          TARBALL=$(ls dist/autofde-*-darwin-arm64.tar.gz)
+          tar -tzf "$TARBALL" > /tmp/contents.txt
+          for f in pi bin/screenpipe extensions/screenpipe.ts run.sh VERSION; do
+            grep -qx "autofde/$f" /tmp/contents.txt
+          done
+          echo "tarball contents OK"
+
+      - name: Smoke test — checksums
+        working-directory: dist
+        run: shasum -a 256 -c SHA256SUMS
+
+      - name: Smoke test — unpack and run binaries
+        run: |
+          set -euo pipefail
+          TARBALL=$(ls dist/autofde-*-darwin-arm64.tar.gz)
+          TMP=$(mktemp -d)
+          tar -xzf "$TARBALL" -C "$TMP"
+          "$TMP/autofde/pi" --version
+          "$TMP/autofde/bin/screenpipe" --version
+          echo "$TMP" > /tmp/unpack_dir
+
+      # Best-effort only: CI runners lack screen-recording permission,
+      # so the engine may fail to start. We still try, to catch
+      # crashes that happen before permission checks.
+      - name: Smoke test — engine health (best-effort)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          TMP=$(cat /tmp/unpack_dir)
+          "$TMP/autofde/bin/screenpipe" record > /tmp/engine.log 2>&1 &
+          ENGINE_PID=$!
+          trap 'kill $ENGINE_PID 2>/dev/null || true' EXIT
+          for _ in $(seq 1 20); do
+            if curl -sf http://localhost:3030/health > /dev/null; then
+              echo "engine healthy on :3030"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "engine did not become healthy within 20s (expected without screen-recording permission)"
+          cat /tmp/engine.log || true
+          exit 1
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BUNDLE_VER=$(python3 -c "import json;print(json.load(open('versions.json'))['bundle'])")
+          PI_VER=$(python3 -c "import json;print(json.load(open('versions.json'))['pi'])")
+          SP_VER=$(python3 -c "import json;print(json.load(open('versions.json'))['screenpipe'])")
+          cat > /tmp/notes.md <<EOF
+          AutomatedFDE bundle built from tag ${GITHUB_REF_NAME}
+
+          | Component | Version |
+          |---|---|
+          | Bundle | ${BUNDLE_VER} |
+          | pi | ${PI_VER} |
+          | screenpipe | ${SP_VER} |
+          EOF
+          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/SHA256SUMS \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file /tmp/notes.md
